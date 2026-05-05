@@ -10,7 +10,14 @@ primary_region = "ams"
 
 [env]
   PORT = "8080"
-  GENLAYER_NETWORK = "studionet"
+  # Address-mapping for the legacy NEWS_ORACLE_ADDRESS env var. Leave at
+  # "testnetBradbury" — that's where the original NEWS_ORACLE_ADDRESS was
+  # deployed. Changing this would orphan that address.
+  GENLAYER_NETWORK = "testnetBradbury"
+  # Which network the UI lands on for new visitors. Independent of the
+  # legacy address mapping above. Users can still pick any *available*
+  # network from the picker (those whose ORACLE_ADDR_<KEY> is configured).
+  SITE_DEFAULT_NETWORK = "studionet"
 
 [http_service]
   internal_port = 8080

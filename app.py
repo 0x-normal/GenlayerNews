@@ -99,8 +99,18 @@ def _network_available(key: str) -> bool:
 
 
 def _default_network() -> str:
-    """Pick the first configured network. Honours the legacy GENLAYER_NETWORK
-    env var when it points at an available network."""
+    """Pick the network the UI should land on for new visitors.
+
+    Resolution order:
+      1. SITE_DEFAULT_NETWORK env var (e.g. "studionet" / "bradbury") if it
+         names an available network. This is the supported UX-default knob.
+      2. The legacy GENLAYER_NETWORK chain id, if it maps to an available
+         network. Kept for backwards compat with older deployments.
+      3. The first available network in declaration order.
+    """
+    site_default = os.environ.get("SITE_DEFAULT_NETWORK", "").strip().lower()
+    if site_default and site_default in NETWORKS and _network_available(site_default):
+        return site_default
     for key, n in NETWORKS.items():
         if n["chain"] == _LEGACY_NETWORK and _network_available(key):
             return key
