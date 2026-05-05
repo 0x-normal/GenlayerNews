@@ -180,42 +180,39 @@ async function runStatus(client) {
   if (!txHash) fail("tx_hash is required for status action");
   if (!aid) fail("article_id is required for status action");
 
-  // Use waitForTransactionReceipt with a string-status target. The SDK
-  // is viem-derived and `getTransactionReceipt` throws "tx not on a block"
-  // for anything that isn't EVM-finalized — useless for GenLayer states.
-  //
-  // We try targets in order of earliest-availability so we can return the
-  // verdict as soon as it's published, without waiting for ACCEPTED on
-  // slow networks (Bradbury). Each attempt has a tight per-call timeout
-  // so the cumulative budget fits well under the backend's 45s ceiling.
+  // Hard global timeout: if anything in this function takes longer than
+  // 25s, bail to "pending" so the frontend can keep polling. Prevents the
+  // helper from hanging on RPC retries (Studio's eth_call sometimes
+  // returns "Internal error" and the SDK retries internally).
+  const globalTimeout = setTimeout(() => {
+    process.stderr.write("[gl_analyse] global 25s timeout — bailing to pending\n");
+    try {
+      process.stdout.write(
+        safeStringify({
+          status: "pending",
+          tx_hash: txHash,
+          article_id: aid,
+          tx_status: null,
+          note: "helper global timeout",
+        }),
+      );
+    } catch {}
+    process.exit(0);
+  }, 25_000);
+  if (typeof globalTimeout.unref === "function") globalTimeout.unref();
+
+  // Fetch the current GenLayer-shaped receipt directly. `getTransaction`
+  // (despite its viem-style name) returns the full receipt with all
+  // GenLayer fields — `consensus_data`, `eq_blocks_outputs`,
+  // `last_round`, etc. — once the tx hits any post-PROPOSING state.
   let receipt = null;
   let fetchErr = null;
   let fetchPath = "none";
-  const targets = [
-    TransactionStatus.COMMITTING,
-    TransactionStatus.REVEALING,
-    TransactionStatus.ACCEPTED,
-    TransactionStatus.FINALIZED,
-  ];
-  for (const status of targets) {
-    try {
-      const r = await client.waitForTransactionReceipt({
-        hash: txHash,
-        status,
-        fullTransaction: true,
-        timeout: 5_000,
-        pollingInterval: 1_000,
-        retryCount: 0,
-      });
-      if (r) {
-        receipt = r;
-        fetchPath = `wait(${status})`;
-        break;
-      }
-    } catch (e) {
-      fetchErr = e;
-      // Try the next target.
-    }
+  try {
+    receipt = await client.getTransaction({ hash: txHash });
+    if (receipt) fetchPath = "getTransaction";
+  } catch (e) {
+    fetchErr = e;
   }
   process.stderr.write(`[gl_analyse] status fetch path=${fetchPath}\n`);
 
@@ -369,11 +366,16 @@ async function runStatus(client) {
     ];
     for (const ep of epContainers) {
       if (!ep) continue;
-      const items = Array.isArray(ep) ? ep : [ep];
+      // eq_outputs on Studio is shaped { "0": { raw }, "1": { raw } } —
+      // use Object.values so numeric-keyed objects are walked too.
+      let items;
+      if (Array.isArray(ep)) items = ep;
+      else if (typeof ep === "object") items = Object.values(ep);
+      else items = [ep];
       for (const it of items) {
         const candidates = typeof it === "string"
           ? [it]
-          : [it?.return, it?.output, it?.value, it?.data, it?.principle, it?.result];
+          : [it?.raw, it?.return, it?.output, it?.value, it?.data, it?.principle, it?.result];
         for (const c of candidates) {
           if (typeof c !== "string") continue;
           // 1. Plain JSON string.
