@@ -2,8 +2,8 @@
 # (or run `fly launch` and let it generate one). Region `lhr` is London;
 # pick one near you with `fly platform regions`.
 
-app = "genlayer-news"
-primary_region = "lhr"
+app = "genlayernews"
+primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
