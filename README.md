@@ -71,23 +71,34 @@ Writes go through a tiny Node helper (`scripts/gl_analyse.mjs`) that uses the of
 
    <https://testnet-faucet.genlayer.foundation/>
 
-4. **Deploy the contract**:
+4. **Deploy the contract** to whichever network(s) you want enabled. The
+   bundled helper handles signing and waits for ACCEPTED:
 
    ```powershell
-   genlayer deploy --contract contracts/news_oracle.py
+   $env:GENLAYER_PRIVATE_KEY="0x..."
+   $env:GENLAYER_NETWORK="testnetBradbury"; node scripts/gl_deploy.mjs
+   $env:GENLAYER_NETWORK="studionet";       node scripts/gl_deploy.mjs
    ```
 
-   Copy the printed contract address.
+   Each run prints the address it deployed to and the matching `ORACLE_ADDR_*`
+   env var to set.
 
-5. **Fill `.env`**:
+5. **Fill `.env`** with one address per network you want to enable:
 
    ```env
-   NEWS_ORACLE_ADDRESS=0x...
    GENLAYER_PRIVATE_KEY=0x...
-   GENLAYER_NETWORK=testnetBradbury
+   ORACLE_ADDR_BRADBURY=0x...
+   ORACLE_ADDR_STUDIONET=0x...        # optional — enables the Studio toggle
+   GENLAYER_NETWORK=testnetBradbury   # default when no per-request override
    ```
 
-6. **Verify on the explorer.** Every analysis the UI marks as "Verified" links to its tx on **GenScope** (<https://genscope.vercel.app>).
+   The frontend's network switcher (top-right of the dateline bar) only shows
+   networks whose `ORACLE_ADDR_*` is set. Others appear greyed-out as a hint
+   to deploy them.
+
+6. **Verify on the explorer.** Every analysis the UI marks as "Verified" links
+   to its tx on **GenScope** (<https://genscope.vercel.app>) for Bradbury, or
+   the equivalent explorer for whichever network it ran on.
 
 ### 3. Start the server
 
@@ -102,8 +113,9 @@ Open <http://localhost:5002>.
 | Path | Purpose |
 | --- | --- |
 | `contracts/news_oracle.py` | The on-chain GenLayer Intelligent Contract. |
-| `scripts/gl_analyse.mjs` | Node helper that uses `genlayer-js` to write to NewsOracle on Bradbury. |
-| `package.json` | Pins the `genlayer-js` dependency for the helper. |
+| `scripts/gl_analyse.mjs` | Two-phase Node helper: submits the analyze() tx (phase 1) and polls for the verdict (phase 2). |
+| `scripts/gl_deploy.mjs` | One-shot deployer for `news_oracle.py` to any GenLayer network. |
+| `package.json` | Pins the `genlayer-js` dependency for both helpers. |
 | `app.py` | Flask backend: news proxies + GenLayer / preview analyse endpoint. |
 | `static/index.html` | Single-file frontend — feed, search, dark mode, consensus panel. |
 | `.env.example` | All configuration knobs. |
@@ -114,7 +126,10 @@ Open <http://localhost:5002>.
 | --- | --- | --- |
 | `GET` | `/api/news` | ChainCatcher news-flash proxy. |
 | `GET` | `/api/newsapi` | NewsAPI.org proxy with per-tab topic mapping. |
-| `POST` | `/api/analyse` | `{ title, content }` → `{ analysis, tx_hash, model }`. |
+| `GET` | `/api/networks` | Lists configured GenLayer networks for the picker UI. |
+| `POST` | `/api/analyse` | `{ title, content, network? }` → broadcasts the tx and returns `{ status: 'pending'\|'ready', tx_hash, article_id, ... }`. |
+| `GET` | `/api/analyse/status` | `?tx_hash=...&article_id=...&network=...` — fast poll endpoint, returns `{ status, analysis? }`. |
+| `GET` | `/healthz` | Liveness + lists which networks are currently configured. |
 
 ## Why this is a real GenLayer build
 

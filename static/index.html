@@ -976,7 +976,41 @@
 
         .dl-r {
             display: flex;
-            gap: 1.5rem
+            gap: 1.5rem;
+            align-items: center;
+        }
+
+        /* network switcher pills */
+        .netsw {
+            display: inline-flex;
+            gap: 0.25rem;
+            padding: 0.18rem;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--card-bg, transparent);
+        }
+        .netsw-b {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.46rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            padding: 0.32rem 0.7rem;
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            border-radius: 999px;
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s, opacity 0.15s;
+        }
+        .netsw-b:hover:not(:disabled) { color: var(--ink); }
+        .netsw-b.on {
+            background: var(--ink);
+            color: var(--bg);
+        }
+        html.dark .netsw-b.on { background: #fff; color: #000; }
+        .netsw-b:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
         }
 
         /* ── LAYOUT ── */
@@ -1757,6 +1791,7 @@
         <div class="dateline">
             <span>Web3 News Intelligence · GenLayer Network</span>
             <div class="dl-r">
+                <div class="netsw" id="netsw" title="Switch GenLayer network"></div>
                 <span id="dl-date"></span>
                 <span id="dl-total">Loading…</span>
             </div>
@@ -1978,13 +2013,76 @@
             return TRANSIENT_ERRORS.some(e => m.includes(e));
         }
 
+        // ── Network switcher state ─────────────────────────────────────────
+        // Persisted in localStorage; sent with every /api/analyse call so
+        // the backend hits the right NewsOracle deployment.
+        let availableNetworks = [];   // [{key,label,chain,available,address}]
+        let currentNetwork = localStorage.getItem('gn:network') || null;
+
+        async function loadNetworks() {
+            try {
+                const res = await fetch(`${BACKEND}/api/networks`);
+                const d = await res.json();
+                if (!d.success) throw new Error('networks endpoint failed');
+                availableNetworks = d.networks || [];
+                // Validate persisted choice; fall back to server default or first available.
+                const validKeys = availableNetworks.filter(n => n.available).map(n => n.key);
+                if (!currentNetwork || !validKeys.includes(currentNetwork)) {
+                    currentNetwork = (d.default && validKeys.includes(d.default)) ? d.default : (validKeys[0] || null);
+                    if (currentNetwork) localStorage.setItem('gn:network', currentNetwork);
+                }
+            } catch (e) {
+                console.warn('[GenLayer] loadNetworks failed:', e.message);
+                availableNetworks = [];
+            }
+            renderNetworks();
+        }
+
+        function renderNetworks() {
+            const host = document.getElementById('netsw');
+            if (!host) return;
+            if (!availableNetworks.length) { host.style.display = 'none'; return; }
+            host.style.display = 'inline-flex';
+            host.innerHTML = availableNetworks.map(n => {
+                const on = n.key === currentNetwork ? ' on' : '';
+                const dis = n.available ? '' : 'disabled';
+                const tip = n.available
+                    ? `Use ${n.chain} (${n.address ? n.address.slice(0,8)+'…' : 'configured'})`
+                    : `${n.chain} — contract not deployed yet`;
+                return `<button class="netsw-b${on}" ${dis} title="${esc(tip)}" onclick="setNetwork('${n.key}')">${esc(n.label)}</button>`;
+            }).join('');
+        }
+
+        function setNetwork(key) {
+            const n = availableNetworks.find(x => x.key === key);
+            if (!n || !n.available || key === currentNetwork) return;
+            currentNetwork = key;
+            localStorage.setItem('gn:network', key);
+            // Clear per-article cache: a verdict from one network's contract
+            // shouldn't be shown when the user switches to another.
+            for (const k of Object.keys(cache)) delete cache[k];
+            renderNetworks();
+            // If something is currently selected, reset its analyse button so
+            // the user can re-run it on the new network.
+            document.querySelectorAll('.btn-tee.done').forEach(b => {
+                b.classList.remove('done');
+                b.innerHTML = `<span>⚡</span>&nbsp;Analyse`;
+            });
+            document.querySelectorAll('.ncrd.done').forEach(c => c.classList.remove('done'));
+        }
+
         // Phase 1: kick off the analyse — backend broadcasts the tx and
         // returns either a cached verdict (status='ready') or a tx_hash
         // (status='pending') we'll poll on.
         async function submitAnalyse(item) {
             const res = await fetch(`${BACKEND}/api/analyse`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ title: item.title, content: item.content || item.description || '', digest: item.digest || '' })
+                body: JSON.stringify({
+                    title: item.title,
+                    content: item.content || item.description || '',
+                    digest: item.digest || '',
+                    network: currentNetwork || undefined,
+                })
             });
             const d = await res.json();
             if (!d.success) throw new Error(d.error || 'Analysis failed');
@@ -2005,7 +2103,8 @@
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
                 let d;
                 try {
-                    const res = await fetch(`${BACKEND}/api/analyse/status?tx_hash=${encodeURIComponent(txHash)}&article_id=${encodeURIComponent(articleId)}`);
+                    const netParam = currentNetwork ? `&network=${encodeURIComponent(currentNetwork)}` : '';
+                    const res = await fetch(`${BACKEND}/api/analyse/status?tx_hash=${encodeURIComponent(txHash)}&article_id=${encodeURIComponent(articleId)}${netParam}`);
                     d = await res.json();
                 } catch (e) {
                     // Network blip — keep trying.
@@ -2403,6 +2502,7 @@
             document.documentElement.classList.add('dark');
         }
 
+        loadNetworks();
         loadFeed(true);
     </script>
 </body>

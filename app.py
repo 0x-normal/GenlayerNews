@@ -43,13 +43,79 @@ except ImportError:  # dotenv is optional in production
 
 # ───────────────────────── Config ──────────────────────────────────────────
 
-NEWS_ORACLE_ADDRESS = os.environ.get("NEWS_ORACLE_ADDRESS", "").strip()
 GENLAYER_PRIVATE_KEY = os.environ.get("GENLAYER_PRIVATE_KEY", "").strip()
-GENLAYER_NETWORK = os.environ.get("GENLAYER_NETWORK", "testnetBradbury").strip()
 GL_NODE_BIN = os.environ.get("GL_NODE_BIN", "node").strip()
 GL_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "gl_analyse.mjs")
 
-GENLAYER_ENABLED = bool(NEWS_ORACLE_ADDRESS and GENLAYER_PRIVATE_KEY)
+# Per-network oracle registry. Each entry maps a stable network key (used
+# in API requests) to the SDK chain identifier and the deployed contract
+# address on that network. A network is "available" only when both the
+# private key and an oracle address are configured.
+#
+# Legacy env vars NEWS_ORACLE_ADDRESS / GENLAYER_NETWORK are honoured as
+# fallbacks so existing deployments keep working.
+_LEGACY_ADDR = os.environ.get("NEWS_ORACLE_ADDRESS", "").strip()
+_LEGACY_NETWORK = os.environ.get("GENLAYER_NETWORK", "testnetBradbury").strip()
+
+
+def _legacy_addr_for(chain_key: str) -> str:
+    """Honour NEWS_ORACLE_ADDRESS only for the network it was originally
+    configured for (defaults to Bradbury). Avoids accidentally pointing
+    Studio traffic at the Bradbury contract."""
+    return _LEGACY_ADDR if chain_key == _LEGACY_NETWORK else ""
+
+
+NETWORKS = {
+    "bradbury": {
+        "label": "Bradbury",
+        "chain": "testnetBradbury",
+        "address": (
+            os.environ.get("ORACLE_ADDR_BRADBURY", "").strip()
+            or _legacy_addr_for("testnetBradbury")
+        ),
+        "explorer": "https://explorer.bradbury.genlayer.com/transactions",
+    },
+    "studionet": {
+        "label": "Studio",
+        "chain": "studionet",
+        "address": os.environ.get("ORACLE_ADDR_STUDIONET", "").strip(),
+        "explorer": "https://studio.genlayer.com/transactions",
+    },
+    "asimov": {
+        "label": "Asimov",
+        "chain": "testnetAsimov",
+        "address": (
+            os.environ.get("ORACLE_ADDR_ASIMOV", "").strip()
+            or _legacy_addr_for("testnetAsimov")
+        ),
+        "explorer": "https://explorer.asimov.genlayer.com/transactions",
+    },
+}
+
+
+def _network_available(key: str) -> bool:
+    n = NETWORKS.get(key)
+    return bool(n and n["address"] and GENLAYER_PRIVATE_KEY)
+
+
+def _default_network() -> str:
+    """Pick the first configured network. Honours the legacy GENLAYER_NETWORK
+    env var when it points at an available network."""
+    for key, n in NETWORKS.items():
+        if n["chain"] == _LEGACY_NETWORK and _network_available(key):
+            return key
+    for key in NETWORKS:
+        if _network_available(key):
+            return key
+    return "bradbury"  # nominal default for error messages
+
+
+DEFAULT_NETWORK = _default_network()
+GENLAYER_ENABLED = any(_network_available(k) for k in NETWORKS)
+
+# Convenience accessors so the rest of the file (and the banner) keep working.
+NEWS_ORACLE_ADDRESS = NETWORKS[DEFAULT_NETWORK]["address"]
+GENLAYER_NETWORK = NETWORKS[DEFAULT_NETWORK]["chain"]
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -87,8 +153,11 @@ print("\n" + "=" * 60)
 print("  GenLayer News  ·  Web3 Intelligence on Trustless AI Consensus")
 print("=" * 60)
 if GENLAYER_ENABLED:
-    print(f"  Mode         : GenLayer Testnet ({GENLAYER_NETWORK})")
-    print(f"  Oracle addr  : {NEWS_ORACLE_ADDRESS}")
+    print(f"  Mode         : GenLayer (default network: {DEFAULT_NETWORK})")
+    for key, n in NETWORKS.items():
+        flag = "✓" if _network_available(key) else "✕"
+        addr = n["address"] or "(not configured)"
+        print(f"    {flag} {key:<10} {n['chain']:<16} {addr}")
 elif OPENAI_API_KEY:
     print(f"  Mode         : Preview (single-validator via {OPENAI_BASE_URL})")
     print(f"  Model        : {OPENAI_MODEL}")
@@ -108,7 +177,32 @@ def index():
 @app.route("/healthz")
 def healthz():
     """Lightweight liveness probe used by Fly / load balancers."""
-    return jsonify({"ok": True, "mode": "genlayer" if GENLAYER_ENABLED else "preview"}), 200
+    return jsonify({
+        "ok": True,
+        "mode": "genlayer" if GENLAYER_ENABLED else ("preview" if OPENAI_API_KEY else "unconfigured"),
+        "default_network": DEFAULT_NETWORK if GENLAYER_ENABLED else None,
+        "networks": [k for k in NETWORKS if _network_available(k)],
+    }), 200
+
+
+@app.route("/api/networks")
+def api_networks():
+    """List networks the frontend can switch between, with availability
+    flags so the picker UI can grey out un-deployed options."""
+    return jsonify({
+        "success": True,
+        "default": DEFAULT_NETWORK if GENLAYER_ENABLED else None,
+        "networks": [
+            {
+                "key": k,
+                "label": n["label"],
+                "chain": n["chain"],
+                "available": _network_available(k),
+                "address": n["address"] or None,
+            }
+            for k, n in NETWORKS.items()
+        ],
+    })
 
 
 # ───────────────────────── News proxies ────────────────────────────────────
@@ -171,17 +265,36 @@ def _article_id(title: str, content: str) -> str:
     return h.hexdigest()[:24]
 
 
-def _run_gl_helper(payload: dict, timeout_s: int) -> dict:
+def _resolve_network(key: str | None) -> tuple[str, dict]:
+    """Translate an incoming network key (or None) into (key, entry). Raises
+    RuntimeError when the key is unknown or its contract isn't configured."""
+    k = (key or DEFAULT_NETWORK).strip().lower()
+    n = NETWORKS.get(k)
+    if not n:
+        raise RuntimeError(
+            f"Unknown network '{k}'. Available: {', '.join(NETWORKS.keys())}."
+        )
+    if not _network_available(k):
+        raise RuntimeError(
+            f"Network '{k}' is not configured on this server. Deploy the "
+            f"NewsOracle contract on {n['chain']} and set ORACLE_ADDR_{k.upper()}."
+        )
+    return k, n
+
+
+def _run_gl_helper(payload: dict, timeout_s: int, network_key: str | None = None) -> dict:
     """Invoke the Node helper with a JSON command on stdin and return its
     parsed JSON response. Raises RuntimeError with a friendly message on
     helper failure."""
     if not os.path.exists(GL_HELPER):
         raise RuntimeError(f"GenLayer helper script missing: {GL_HELPER}")
 
+    _, net = _resolve_network(network_key)
+
     env = os.environ.copy()
-    env["NEWS_ORACLE_ADDRESS"] = NEWS_ORACLE_ADDRESS
+    env["NEWS_ORACLE_ADDRESS"] = net["address"]
     env["GENLAYER_PRIVATE_KEY"] = GENLAYER_PRIVATE_KEY
-    env["GENLAYER_NETWORK"] = GENLAYER_NETWORK
+    env["GENLAYER_NETWORK"] = net["chain"]
 
     try:
         proc = subprocess.run(
@@ -218,22 +331,24 @@ def _run_gl_helper(payload: dict, timeout_s: int) -> dict:
         )
 
 
-def gl_submit(title: str, content: str) -> dict:
+def gl_submit(title: str, content: str, network_key: str | None = None) -> dict:
     """Phase 1: broadcast analyze() (or use cached storage) and return
     immediately. Result has either status='ready' (cache hit) or
     status='pending' with a tx_hash to poll."""
     return _run_gl_helper(
         {"action": "submit", "title": title, "content": content},
         timeout_s=60,  # broadcasting only — must be fast
+        network_key=network_key,
     )
 
 
-def gl_status(tx_hash: str, article_id: str) -> dict:
+def gl_status(tx_hash: str, article_id: str, network_key: str | None = None) -> dict:
     """Phase 2: poll the chain to see if the verdict is ready. Each call is
     designed to complete in <10s."""
     return _run_gl_helper(
         {"action": "status", "tx_hash": tx_hash, "article_id": article_id},
         timeout_s=30,  # short — frontend will retry on the next poll
+        network_key=network_key,
     )
 
 
@@ -356,11 +471,12 @@ def _retry(fn, retries=3):
     raise last
 
 
-def _label(cached: bool) -> str:
+def _label(cached: bool, chain: str | None = None) -> str:
+    chain = chain or GENLAYER_NETWORK
     return (
-        f"GenLayer Storage · {GENLAYER_NETWORK}"
+        f"GenLayer Storage · {chain}"
         if cached
-        else f"GenLayer Consensus · {GENLAYER_NETWORK}"
+        else f"GenLayer Consensus · {chain}"
     )
 
 
@@ -383,24 +499,28 @@ def analyse_submit():
     if not title:
         return jsonify({"success": False, "error": "No title provided"}), 400
 
-    print(f"[analyse] {title[:80]}…")
+    network_key = (data.get("network") or "").strip().lower() or None
+    print(f"[analyse] {title[:80]}…  network={network_key or DEFAULT_NETWORK}")
 
     try:
         if GENLAYER_ENABLED:
-            out = gl_submit(title, content)
+            out = gl_submit(title, content, network_key=network_key)
             tx_hash = out.get("tx_hash") or ""
             aid = out.get("article_id") or _article_id(title, content)
             cached = bool(out.get("cached"))
             status = out.get("status") or "pending"
+            resolved_key, net = _resolve_network(network_key)
             resp = {
                 "success": True,
                 "status": status,
+                "network": resolved_key,
+                "chain": net["chain"],
                 "tx_hash": tx_hash,
                 "payment_hash": tx_hash,  # back-compat
                 "article_id": aid,
                 "cached": cached,
-                "contract": out.get("contract") or NEWS_ORACLE_ADDRESS,
-                "model": _label(cached),
+                "contract": out.get("contract") or net["address"],
+                "model": _label(cached, net["chain"]),
             }
             if status == "ready":
                 resp["analysis"] = out.get("analysis")
@@ -436,6 +556,7 @@ def analyse_status():
 
     tx_hash = (request.args.get("tx_hash") or "").strip()
     aid = (request.args.get("article_id") or "").strip()
+    network_key = (request.args.get("network") or "").strip().lower() or None
     if not tx_hash:
         return jsonify({"success": False, "error": "tx_hash is required"}), 400
     if not aid:
@@ -444,7 +565,8 @@ def analyse_status():
         return jsonify({"success": False, "error": "GenLayer mode not configured"}), 400
 
     try:
-        out = gl_status(tx_hash, aid)
+        resolved_key, net = _resolve_network(network_key)
+        out = gl_status(tx_hash, aid, network_key=resolved_key)
     except Exception as e:  # noqa: BLE001
         msg = str(e)
         print(f"[analyse:status] ERROR: {msg}")
@@ -454,12 +576,14 @@ def analyse_status():
     resp = {
         "success": True,
         "status": status,
+        "network": resolved_key,
+        "chain": net["chain"],
         "tx_hash": tx_hash,
         "payment_hash": tx_hash,
         "article_id": aid,
-        "contract": NEWS_ORACLE_ADDRESS,
+        "contract": net["address"],
         "tx_status": out.get("tx_status"),
-        "model": _label(False),
+        "model": _label(False, net["chain"]),
     }
     if status == "ready":
         resp["analysis"] = out.get("analysis")
