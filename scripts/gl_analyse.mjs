@@ -180,41 +180,41 @@ async function runStatus(client) {
   if (!txHash) fail("tx_hash is required for status action");
   if (!aid) fail("article_id is required for status action");
 
-  // Fast path: getTransactionReceipt returns the GenLayer-shaped receipt
-  // (with consensus_data, equivalence_principle_outputs, etc.) for the
-  // tx's *current* state — no status gating, no polling. This is what
-  // contains the verdict once the tx hits COMMITTING.
+  // Use waitForTransactionReceipt with a string-status target. The SDK
+  // is viem-derived and `getTransactionReceipt` throws "tx not on a block"
+  // for anything that isn't EVM-finalized — useless for GenLayer states.
   //
-  // (Note: client.getTransaction is viem-style and returns only the tx
-  //  envelope without consensus_data — useless to us here.)
+  // We try targets in order of earliest-availability so we can return the
+  // verdict as soon as it's published, without waiting for ACCEPTED on
+  // slow networks (Bradbury). Each attempt has a tight per-call timeout
+  // so the cumulative budget fits well under the backend's 45s ceiling.
   let receipt = null;
   let fetchErr = null;
   let fetchPath = "none";
-  try {
-    if (typeof client.getTransactionReceipt === "function") {
-      receipt = await client.getTransactionReceipt({ hash: txHash });
-      fetchPath = "getTransactionReceipt";
-    }
-  } catch (e) {
-    fetchErr = e;
-  }
-
-  // Fallback: short waitForTransactionReceipt at COMMITTING. Some tx
-  // states cause getTransactionReceipt to throw "tx not found" while the
-  // wait variant happily returns whatever is available now.
-  if (!receipt) {
+  const targets = [
+    TransactionStatus.COMMITTING,
+    TransactionStatus.REVEALING,
+    TransactionStatus.ACCEPTED,
+    TransactionStatus.FINALIZED,
+  ];
+  for (const status of targets) {
     try {
-      receipt = await client.waitForTransactionReceipt({
+      const r = await client.waitForTransactionReceipt({
         hash: txHash,
-        status: TransactionStatus.COMMITTING,
+        status,
         fullTransaction: true,
-        timeout: 6_000,
+        timeout: 5_000,
         pollingInterval: 1_000,
         retryCount: 0,
       });
-      fetchPath = "waitForTransactionReceipt(COMMITTING)";
+      if (r) {
+        receipt = r;
+        fetchPath = `wait(${status})`;
+        break;
+      }
     } catch (e) {
       fetchErr = e;
+      // Try the next target.
     }
   }
   process.stderr.write(`[gl_analyse] status fetch path=${fetchPath}\n`);
