@@ -352,32 +352,57 @@ async function runStatus(client) {
       if (v) return v;
     }
 
-    // Studio path: equivalence-principle outputs are exposed as plain
-    // (unescaped) JSON strings at well-known keys. Try them before doing
-    // the expensive recursive walk.
-    const epStrings = [
+    // Studio path: the LLM's JSON verdict is published in eq_blocks_outputs
+    // (or under consensus_data.last_round.eq_outputs). Each entry is either
+    // a raw JSON string, an object { principle, output }, or a base64 /
+    // hex blob containing the JSON.
+    const epContainers = [
+      r?.eq_blocks_outputs,
       r?.equivalence_principle_outputs,
       r?.equivalencePrincipleOutputs,
-      r?.eq_outputs,
+      r?.consensus_data?.last_round?.eq_blocks_outputs,
       r?.consensus_data?.last_round?.equivalence_principle_outputs,
       r?.consensus_data?.last_round?.eq_outputs,
+      r?.consensus_data?.leader_receipt?.[0]?.eq_blocks_outputs,
       r?.consensus_data?.leader_receipt?.[0]?.equivalence_principle_outputs,
       r?.consensus_data?.leader_receipt?.[0]?.eq_outputs,
     ];
-    for (const ep of epStrings) {
+    for (const ep of epContainers) {
       if (!ep) continue;
       const items = Array.isArray(ep) ? ep : [ep];
       for (const it of items) {
-        // Each item may be { return, output, value } or a bare string.
         const candidates = typeof it === "string"
           ? [it]
-          : [it?.return, it?.output, it?.value, it?.data];
+          : [it?.return, it?.output, it?.value, it?.data, it?.principle, it?.result];
         for (const c of candidates) {
-          if (typeof c !== "string" || !c.trim().startsWith("{")) continue;
-          try {
-            const parsed = JSON.parse(c);
-            if (looksLikeVerdict(parsed)) return parsed;
-          } catch {}
+          if (typeof c !== "string") continue;
+          // 1. Plain JSON string.
+          const trimmed = c.trim();
+          if (trimmed.startsWith("{")) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (looksLikeVerdict(parsed)) return parsed;
+            } catch {}
+          }
+          // 2. Hex-encoded JSON.
+          if (trimmed.startsWith("0x") && trimmed.length > 100) {
+            const hit = findVerdictInHex(trimmed);
+            if (hit) return hit;
+          }
+          // 3. Base64-encoded JSON (Studio receipts use this for raw blobs).
+          if (/^[A-Za-z0-9+/=]{40,}$/.test(trimmed)) {
+            try {
+              const decoded = Buffer.from(trimmed, "base64").toString("latin1");
+              const start = decoded.indexOf("{");
+              const end = decoded.lastIndexOf("}");
+              if (start !== -1 && end > start) {
+                try {
+                  const parsed = JSON.parse(decoded.slice(start, end + 1));
+                  if (looksLikeVerdict(parsed)) return parsed;
+                } catch {}
+              }
+            } catch {}
+          }
         }
       }
     }
@@ -429,16 +454,29 @@ async function runStatus(client) {
   let analysis = extractReturnValue(receipt);
 
   if (analysis == null) {
-    // Receipt available but verdict not yet extractable. Dump the receipt
-    // shape to stderr so Fly logs show us where the verdict actually lives
-    // on whichever network we're on. Truncated to keep logs manageable.
+    // Receipt available but verdict not yet extractable. Dump the
+    // verdict-bearing fields (eq_blocks_outputs, leader_receipt) as
+    // separate stderr lines — putting them in one big truncated string
+    // means we lose the field of interest behind the leader's RLP blob.
     try {
-      const dump = safeStringify(receipt).slice(0, 4000);
-      const keys = receipt && typeof receipt === "object" ? Object.keys(receipt) : [];
+      const eq = receipt?.eq_blocks_outputs;
+      const lr = receipt?.consensus_data?.leader_receipt;
       process.stderr.write(
-        `[gl_analyse] no verdict in receipt. status_name=${receipt?.status_name ?? receipt?.status ?? "?"} ` +
-          `keys=${keys.join(",")} dump=${dump}\n`,
+        `[gl_analyse] no verdict. status=${receipt?.status_name ?? receipt?.status ?? "?"} ` +
+          `eq_type=${Array.isArray(eq) ? `array[${eq.length}]` : typeof eq} ` +
+          `lr_type=${Array.isArray(lr) ? `array[${lr.length}]` : typeof lr}\n`,
       );
+      if (eq) {
+        process.stderr.write(`[gl_analyse] eq_blocks_outputs=${safeStringify(eq).slice(0, 3000)}\n`);
+      }
+      if (lr && Array.isArray(lr) && lr[0]) {
+        const first = lr[0];
+        const firstKeys = first && typeof first === "object" ? Object.keys(first) : [];
+        process.stderr.write(
+          `[gl_analyse] leader_receipt[0] keys=${firstKeys.join(",")} ` +
+            `eq_outputs=${safeStringify(first.eq_outputs ?? first.eq_blocks_outputs ?? first.equivalence_principle_outputs).slice(0, 2000)}\n`,
+        );
+      }
     } catch {}
     process.stdout.write(
       safeStringify({
