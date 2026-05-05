@@ -171,17 +171,10 @@ def _article_id(title: str, content: str) -> str:
     return h.hexdigest()[:24]
 
 
-def analyse_via_genlayer(title: str, content: str) -> dict:
-    """
-    Submit NewsOracle.analyze(title, content) to GenLayer Testnet Bradbury
-    via the official genlayer-js SDK (wrapped in a tiny Node helper) and
-    return:
-        { analysis: {...}, tx_hash: "0x...", model: "GenLayer Consensus" }
-
-    The Node helper handles transaction signing, network-aware chain
-    selection, and waiting for finality — things that are extremely
-    painful to do correctly in raw Python.
-    """
+def _run_gl_helper(payload: dict, timeout_s: int) -> dict:
+    """Invoke the Node helper with a JSON command on stdin and return its
+    parsed JSON response. Raises RuntimeError with a friendly message on
+    helper failure."""
     if not os.path.exists(GL_HELPER):
         raise RuntimeError(f"GenLayer helper script missing: {GL_HELPER}")
 
@@ -190,17 +183,13 @@ def analyse_via_genlayer(title: str, content: str) -> dict:
     env["GENLAYER_PRIVATE_KEY"] = GENLAYER_PRIVATE_KEY
     env["GENLAYER_NETWORK"] = GENLAYER_NETWORK
 
-    payload = json.dumps({"title": title, "content": content})
     try:
-        # Generous timeout: Bradbury takes a while. The Node helper itself
-        # waits up to ~12 min for COMMITTING, so we give it a 14-min budget
-        # before forcibly killing the subprocess.
         proc = subprocess.run(
             [GL_NODE_BIN, GL_HELPER],
-            input=payload,
+            input=json.dumps(payload),
             capture_output=True,
             text=True,
-            timeout=14 * 60,
+            timeout=timeout_s,
             env=env,
         )
     except FileNotFoundError as e:
@@ -208,14 +197,11 @@ def analyse_via_genlayer(title: str, content: str) -> dict:
             "Node.js not found. Install Node 18+ and run `npm install` in the project root."
         ) from e
 
-    # Always echo the helper's stderr to our log — it carries diagnostic
-    # info (receipt dumps, cache-read misses) we want visible during dev.
     if proc.stderr:
         for line in proc.stderr.rstrip().splitlines():
             print(f"[gl_analyse:stderr] {line}")
 
     if proc.returncode != 0:
-        # Helper prints JSON {error: ...} to stdout on failure.
         try:
             err = json.loads(proc.stdout or "{}").get("error")
         except Exception:  # noqa: BLE001
@@ -225,36 +211,30 @@ def analyse_via_genlayer(title: str, content: str) -> dict:
         )
 
     try:
-        out = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             f"Could not parse GenLayer helper output: {e}\nstdout: {proc.stdout[:400]}"
         )
 
-    analysis = out.get("analysis")
-    tx_hash = out.get("tx_hash") or ""
-    cached = bool(out.get("cached"))
-    contract = out.get("contract") or NEWS_ORACLE_ADDRESS
 
-    if not isinstance(analysis, dict):
-        raise RuntimeError(f"GenLayer returned no analysis: {out!r}")
-    # tx_hash is intentionally optional: a cache-hit read returns no tx.
-    if not cached and not tx_hash:
-        raise RuntimeError("GenLayer returned no tx_hash for a non-cached call")
-
-    label = (
-        f"GenLayer Storage · {GENLAYER_NETWORK}"
-        if cached
-        else f"GenLayer Consensus · {GENLAYER_NETWORK}"
+def gl_submit(title: str, content: str) -> dict:
+    """Phase 1: broadcast analyze() (or use cached storage) and return
+    immediately. Result has either status='ready' (cache hit) or
+    status='pending' with a tx_hash to poll."""
+    return _run_gl_helper(
+        {"action": "submit", "title": title, "content": content},
+        timeout_s=60,  # broadcasting only — must be fast
     )
 
-    return {
-        "analysis": analysis,
-        "tx_hash": tx_hash,
-        "cached": cached,
-        "contract": contract,
-        "model": label,
-    }
+
+def gl_status(tx_hash: str, article_id: str) -> dict:
+    """Phase 2: poll the chain to see if the verdict is ready. Each call is
+    designed to complete in <10s."""
+    return _run_gl_helper(
+        {"action": "status", "tx_hash": tx_hash, "article_id": article_id},
+        timeout_s=30,  # short — frontend will retry on the next poll
+    )
 
 
 # ───────────────────────── Preview-mode client ─────────────────────────────
@@ -376,8 +356,23 @@ def _retry(fn, retries=3):
     raise last
 
 
+def _label(cached: bool) -> str:
+    return (
+        f"GenLayer Storage · {GENLAYER_NETWORK}"
+        if cached
+        else f"GenLayer Consensus · {GENLAYER_NETWORK}"
+    )
+
+
 @app.route("/api/analyse", methods=["POST", "OPTIONS"])
-def analyse():
+def analyse_submit():
+    """Phase 1 — broadcast the tx (or hit cache) and return quickly.
+
+    Response shape:
+      { success, status: 'ready'|'pending', tx_hash, article_id,
+        analysis?, model?, cached?, contract? }
+
+    The frontend should poll /api/analyse/status until status='ready'."""
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
@@ -392,32 +387,83 @@ def analyse():
 
     try:
         if GENLAYER_ENABLED:
-            # No outer retries on the GenLayer path: each attempt sends a
-            # fresh, gas-paying tx. The helper itself waits patiently for
-            # COMMITTING and falls back through several read paths, so a
-            # single attempt is the right policy. Users can click again
-            # if it fails.
-            result = analyse_via_genlayer(title, content)
-        else:
-            result = _retry(lambda: analyse_via_openai(title, content))
-
-        return jsonify(
-            {
+            out = gl_submit(title, content)
+            tx_hash = out.get("tx_hash") or ""
+            aid = out.get("article_id") or _article_id(title, content)
+            cached = bool(out.get("cached"))
+            status = out.get("status") or "pending"
+            resp = {
                 "success": True,
-                "analysis": result["analysis"],
-                "tx_hash": result.get("tx_hash") or "",
-                # Kept for backwards-compat with the original frontend field name
-                "payment_hash": result.get("tx_hash") or "",
-                "cached": result.get("cached", False),
-                "contract": result.get("contract", ""),
-                "model": result["model"],
-                "article_id": _article_id(title, content),
+                "status": status,
+                "tx_hash": tx_hash,
+                "payment_hash": tx_hash,  # back-compat
+                "article_id": aid,
+                "cached": cached,
+                "contract": out.get("contract") or NEWS_ORACLE_ADDRESS,
+                "model": _label(cached),
             }
-        )
+            if status == "ready":
+                resp["analysis"] = out.get("analysis")
+            return jsonify(resp)
+        else:
+            # Preview / OpenAI mode is synchronous and fast.
+            result = _retry(lambda: analyse_via_openai(title, content))
+            return jsonify(
+                {
+                    "success": True,
+                    "status": "ready",
+                    "analysis": result["analysis"],
+                    "tx_hash": result.get("tx_hash") or "",
+                    "payment_hash": result.get("tx_hash") or "",
+                    "cached": result.get("cached", False),
+                    "contract": result.get("contract", ""),
+                    "model": result["model"],
+                    "article_id": _article_id(title, content),
+                }
+            )
     except Exception as e:  # noqa: BLE001
         msg = str(e)
-        print(f"[analyse] ERROR: {msg}")
+        print(f"[analyse:submit] ERROR: {msg}")
         return jsonify({"success": False, "error": _friendly_error(msg)}), 500
+
+
+@app.route("/api/analyse/status", methods=["GET", "OPTIONS"])
+def analyse_status():
+    """Phase 2 — poll endpoint. Frontend calls this every few seconds with
+    the tx_hash returned from /api/analyse until the verdict is ready."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    tx_hash = (request.args.get("tx_hash") or "").strip()
+    aid = (request.args.get("article_id") or "").strip()
+    if not tx_hash:
+        return jsonify({"success": False, "error": "tx_hash is required"}), 400
+    if not aid:
+        return jsonify({"success": False, "error": "article_id is required"}), 400
+    if not GENLAYER_ENABLED:
+        return jsonify({"success": False, "error": "GenLayer mode not configured"}), 400
+
+    try:
+        out = gl_status(tx_hash, aid)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        print(f"[analyse:status] ERROR: {msg}")
+        return jsonify({"success": False, "error": _friendly_error(msg)}), 500
+
+    status = out.get("status") or "pending"
+    resp = {
+        "success": True,
+        "status": status,
+        "tx_hash": tx_hash,
+        "payment_hash": tx_hash,
+        "article_id": aid,
+        "contract": NEWS_ORACLE_ADDRESS,
+        "tx_status": out.get("tx_status"),
+        "model": _label(False),
+    }
+    if status == "ready":
+        resp["analysis"] = out.get("analysis")
+    return jsonify(resp)
 
 
 if __name__ == "__main__":

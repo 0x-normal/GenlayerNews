@@ -1978,7 +1978,10 @@
             return TRANSIENT_ERRORS.some(e => m.includes(e));
         }
 
-        async function callAnalyseAPI(item) {
+        // Phase 1: kick off the analyse — backend broadcasts the tx and
+        // returns either a cached verdict (status='ready') or a tx_hash
+        // (status='pending') we'll poll on.
+        async function submitAnalyse(item) {
             const res = await fetch(`${BACKEND}/api/analyse`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ title: item.title, content: item.content || item.description || '', digest: item.digest || '' })
@@ -1986,6 +1989,43 @@
             const d = await res.json();
             if (!d.success) throw new Error(d.error || 'Analysis failed');
             return d;
+        }
+
+        // Phase 2: poll until the verdict is ready. Each poll completes in
+        // <10s on the server side, so the edge proxy never times us out
+        // even if Bradbury takes 10+ minutes to commit.
+        async function pollAnalyseStatus(txHash, articleId, onTick) {
+            const POLL_INTERVAL = 5_000;          // 5s between polls
+            const MAX_POLL_MS = 15 * 60 * 1000;   // 15 min total budget
+            const start = Date.now();
+            let pollCount = 0;
+            while (Date.now() - start < MAX_POLL_MS) {
+                pollCount++;
+                onTick && onTick(pollCount, txHash);
+                await new Promise(r => setTimeout(r, POLL_INTERVAL));
+                let d;
+                try {
+                    const res = await fetch(`${BACKEND}/api/analyse/status?tx_hash=${encodeURIComponent(txHash)}&article_id=${encodeURIComponent(articleId)}`);
+                    d = await res.json();
+                } catch (e) {
+                    // Network blip — keep trying.
+                    console.warn('[GenLayer] poll network error:', e.message);
+                    continue;
+                }
+                if (!d.success) throw new Error(d.error || 'Status check failed');
+                if (d.status === 'ready') return d;
+                // else status='pending' — loop
+            }
+            throw new Error('Timed out waiting for consensus after 15 minutes. The transaction may still complete on-chain — try again or check the explorer.');
+        }
+
+        // Convenience wrapper: submit + (if needed) poll. Returns final
+        // ready-state response.
+        async function callAnalyseAPI(item, onTick) {
+            const submitted = await submitAnalyse(item);
+            if (submitted.status === 'ready') return submitted;
+            // Pending — poll. Update the loading UI on every tick.
+            return await pollAnalyseStatus(submitted.tx_hash, submitted.article_id, onTick);
         }
 
         async function doAnalyse(id) {
@@ -1999,9 +2039,16 @@
             const MAX_RETRIES = 5;
             const RETRY_DELAY = 1800; // ms between retries
 
+            const onTick = (n, tx) => {
+                const lbl = document.querySelector('.aploading-lbl');
+                if (!lbl) return;
+                const short = tx ? tx.slice(0, 10) + '…' + tx.slice(-6) : '';
+                lbl.innerHTML = `<span class="lspin"></span>Waiting for consensus… (poll #${n}${short ? ' · ' + esc(short) : ''})`;
+            };
+
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
                 try {
-                    const d = await callAnalyseAPI(item);
+                    const d = await callAnalyseAPI(item, onTick);
                     cache[id] = {
                         item,
                         analysis: d.analysis,
@@ -2026,7 +2073,7 @@
                     // Non-transient or exhausted retries — show error
                     if (btn) { btn.disabled = false; btn.innerHTML = `<span>⚡</span>&nbsp;Retry` }
                     document.getElementById('apscroll').innerHTML =
-                        `<div class="errbox" style="margin:1.5rem">Analysis failed after ${attempt} attempt${attempt > 1 ? 's' : ''}:<br>${esc(msg)}<br><br>Is app.py running on port 5002?</div>`;
+                        `<div class="errbox" style="margin:1.5rem">Analysis failed after ${attempt} attempt${attempt > 1 ? 's' : ''}:<br>${esc(msg)}</div>`;
                     return;
                 }
             }

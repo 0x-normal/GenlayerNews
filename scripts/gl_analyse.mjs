@@ -1,12 +1,20 @@
 /**
- * gl_analyse.mjs — submits an `analyze(title, content)` write transaction
- * to the deployed NewsOracle Intelligent Contract on GenLayer Testnet
- * Bradbury, waits for finality, and prints the consensus verdict to
- * stdout as JSON.
+ * gl_analyse.mjs — two-phase helper for the NewsOracle contract on
+ * GenLayer Testnet Bradbury. Designed for managed-host deployment where
+ * synchronous HTTP requests are capped at ~60s by the edge proxy.
  *
- * Reads a single JSON object `{ "title": "...", "content": "..." }` from
- * stdin. Outputs `{ "tx_hash": "0x..", "analysis": {...} }` on success or
- * `{ "error": "..." }` on failure (exit code 1).
+ * Reads a single JSON command on stdin and writes a JSON result on stdout.
+ *
+ *   { action: "submit", title, content }
+ *     -> Cache check; if miss, broadcasts analyze(title, content). Returns
+ *        immediately with { status, tx_hash, article_id, analysis? }.
+ *        status is "ready" on cache hit, "pending" once the tx is broadcast.
+ *
+ *   { action: "status", tx_hash, article_id }
+ *     -> Quick check: fetches the tx state and tries to extract the verdict.
+ *        Returns { status: "pending"|"ready", analysis?, tx_status? }.
+ *        Designed to complete in <10s so frontend polling never hits a
+ *        proxy timeout.
  *
  * Env:
  *   NEWS_ORACLE_ADDRESS   address of the deployed NewsOracle contract
@@ -17,7 +25,7 @@
 
 import { createClient, createAccount } from "genlayer-js";
 import * as chains from "genlayer-js/chains";
-import { TransactionStatus, ExecutionResult } from "genlayer-js/types";
+import { TransactionStatus } from "genlayer-js/types";
 import { createHash } from "node:crypto";
 
 /**
@@ -79,19 +87,39 @@ try {
 } catch (e) {
   fail(`Could not parse stdin JSON: ${e.message}`);
 }
-const title = payload?.title || "";
-const content = payload?.content || "";
-if (!title) fail("title is required");
+
+const action = payload?.action || "submit";
 
 try {
   const account = createAccount(PRIV);
   const client = createClient({ chain, account });
+
+  if (action === "submit") {
+    await runSubmit(client);
+  } else if (action === "status") {
+    await runStatus(client);
+  } else {
+    fail(`Unknown action: ${action}. Expected "submit" or "status".`);
+  }
+} catch (e) {
+  fail(e?.message || String(e));
+}
+
+// ───────────────────────── Phase 1: submit ──────────────────────────────
+//
+// Sends the analyze() tx if there isn't already a stored verdict for this
+// article. Returns immediately — does NOT wait for consensus. The frontend
+// will poll the status endpoint instead.
+
+async function runSubmit(client) {
+  const title = payload?.title || "";
+  const content = payload?.content || "";
+  if (!title) fail("title is required");
   const aid = articleId(title, content);
 
-  // Step 0 — cheap, free read-only check. If this article has already been
-  // analysed in any prior tx (by us or anyone else), skip the write and
-  // hydrate from contract storage. Saves gas, sidesteps Bradbury sequencer
-  // outages, and makes repeat clicks instant.
+  // Step 0 — free read-only cache check. If this article has been analysed
+  // before (by us or anyone), reuse the stored verdict. Saves gas and is
+  // instant for repeat clicks.
   try {
     const cached = await client.readContract({
       address: ADDRESS,
@@ -103,7 +131,9 @@ try {
       const parsed = JSON.parse(cached);
       process.stdout.write(
         safeStringify({
+          status: "ready",
           tx_hash: "",
+          article_id: aid,
           cached: true,
           contract: ADDRESS,
           analysis: parsed,
@@ -112,40 +142,98 @@ try {
       process.exit(0);
     }
   } catch (e) {
-    // Read failure shouldn't block the write path — log to stderr and
-    // proceed to consensus. Common cause: brand-new article (storage miss
-    // returns "" not an error, but some SDK paths throw on empty state).
     process.stderr.write(`[gl_analyse] cache-read miss: ${e.message}\n`);
   }
 
+  // No cache hit — broadcast the write tx and return its hash without
+  // waiting for consensus. The frontend will poll /api/analyse/status.
   const txHash = await client.writeContract({
-    account,
+    account: client.account,
     address: ADDRESS,
     functionName: "analyze",
     args: [title, content],
     value: 0,
   });
 
-  // Wait for COMMITTING (status 3) — this is the earliest point where the
-  // leader has published its execution result. Waiting for ACCEPTED (5) or
-  // FINALIZED (7) is unnecessary: the verdict is already deterministic and
-  // visible on-chain at COMMITTING. We're literally racing to grab the
-  // value as soon as it appears, so the user doesn't sit through the full
-  // reveal+accept cycle (often 60–120s of extra latency on Bradbury).
-  // Bradbury can take several minutes to move a tx from PENDING -> COMMITTING
-  // depending on validator availability. Wait patiently — viem's default
-  // 60s timeout is far too short. We poll every 4s for up to 12 minutes.
-  process.stderr.write(
-    `[gl_analyse] waiting for COMMITTING on ${txHash} (up to 12 min)…\n`,
+  process.stderr.write(`[gl_analyse] submitted ${txHash} for ${aid}\n`);
+  process.stdout.write(
+    safeStringify({
+      status: "pending",
+      tx_hash: txHash,
+      article_id: aid,
+      cached: false,
+      contract: ADDRESS,
+    }),
   );
-  const receipt = await client.waitForTransactionReceipt({
-    hash: txHash,
-    status: TransactionStatus.COMMITTING,
-    fullTransaction: true, // we need consensusData / leaderReceipt
-    timeout: 12 * 60 * 1000, // 12 minutes
-    pollingInterval: 4_000,
-    retryCount: 0,
-  });
+  process.exit(0);
+}
+
+// ───────────────────────── Phase 2: status ──────────────────────────────
+//
+// Quick poll: fetch the tx receipt and extract the verdict if available.
+// Designed to complete in <10s so the frontend can call this on a 5s
+// interval without ever hitting a proxy timeout.
+
+async function runStatus(client) {
+  const txHash = payload?.tx_hash;
+  const aid = payload?.article_id;
+  if (!txHash) fail("tx_hash is required for status action");
+  if (!aid) fail("article_id is required for status action");
+
+  // First, try the contract storage — if the verdict is already stored at
+  // accepted/finalized state, this is the cheapest path.
+  for (const stateStatus of ["finalized", "accepted"]) {
+    try {
+      const raw = await client.readContract({
+        address: ADDRESS,
+        functionName: "get_analysis",
+        args: [aid],
+        stateStatus,
+      });
+      if (typeof raw === "string" && raw.length > 0) {
+        const parsed = JSON.parse(raw);
+        process.stdout.write(
+          safeStringify({
+            status: "ready",
+            tx_hash: txHash,
+            article_id: aid,
+            tx_status: stateStatus,
+            analysis: parsed,
+          }),
+        );
+        process.exit(0);
+      }
+    } catch (e) {
+      // Empty storage often throws — keep trying.
+    }
+  }
+
+  // Storage miss. Try to read the receipt directly. If the tx has reached
+  // COMMITTING the leader's verdict is already in the receipt blob.
+  let receipt = null;
+  try {
+    receipt = await client.waitForTransactionReceipt({
+      hash: txHash,
+      status: TransactionStatus.COMMITTING,
+      fullTransaction: true,
+      timeout: 5_000, // short — we want this poll to be quick
+      pollingInterval: 1_000,
+      retryCount: 0,
+    });
+  } catch (e) {
+    // Most common: still PENDING/PROPOSING. Report pending.
+    const m = (e?.message || "").match(/current status: (\d+)/i);
+    const currentStatus = m ? Number(m[1]) : null;
+    process.stdout.write(
+      safeStringify({
+        status: "pending",
+        tx_hash: txHash,
+        article_id: aid,
+        tx_status: currentStatus,
+      }),
+    );
+    process.exit(0);
+  }
 
   // Note: at COMMITTING, receipt.txExecutionResultName is often "NOT_VOTED"
   // because the *aggregate* result only finalizes after the REVEAL phase.
@@ -292,46 +380,24 @@ try {
     return null;
   }
 
+  // Tx reached COMMITTING — extract the verdict from the receipt.
   let analysis = extractReturnValue(receipt);
 
-  // Fallback: ask the contract for the canonical stored verdict. Use
-  // stateStatus "finalized" first, then "accepted", then no override — the
-  // SDK exposes whichever level of finality is currently live.
   if (analysis == null) {
-    for (const stateStatus of ["finalized", "accepted", undefined]) {
-      try {
-        const raw = await client.readContract({
-          address: ADDRESS,
-          functionName: "get_analysis",
-          args: [aid],
-          ...(stateStatus ? { stateStatus } : {}),
-        });
-        if (typeof raw === "string" && raw.length > 0) {
-          analysis = raw;
-          break;
-        }
-      } catch (e) {
-        process.stderr.write(
-          `[gl_analyse] read fallback (${stateStatus || "default"}) failed: ${e.message}\n`,
-        );
-      }
-    }
-  }
-
-  if (analysis == null) {
-    let dump;
-    try {
-      dump = safeStringify(receipt, 2);
-    } catch (e) {
-      dump = `<could not stringify receipt: ${e.message}> keys=${Object.keys(receipt || {}).join(",")}`;
-    }
-    process.stderr.write(
-      `[gl_analyse] receipt dump for ${txHash}:\n${(dump || "").slice(0, 6000)}\n`,
+    // Receipt available but verdict not yet extractable — usually means
+    // the leader's eq-block hasn't been finalized into the receipt yet.
+    // Report pending so the frontend keeps polling; on the next poll the
+    // storage path likely succeeds.
+    process.stdout.write(
+      safeStringify({
+        status: "pending",
+        tx_hash: txHash,
+        article_id: aid,
+        tx_status: receipt?.status ?? null,
+        note: "receipt has no verdict yet",
+      }),
     );
-    fail(
-      `Tx ${txHash} reached COMMITTING but neither the receipt nor ` +
-        `get_analysis(${aid}) yielded a verdict. See app.py logs for the receipt dump.`,
-    );
+    process.exit(0);
   }
 
   if (typeof analysis === "string") {
@@ -343,18 +409,17 @@ try {
   }
 
   if (typeof analysis !== "object" || analysis === null) {
-    fail(`Verdict had unexpected shape: ${JSON.stringify(analysis)}`);
+    fail(`Verdict had unexpected shape: ${safeStringify(analysis)}`);
   }
 
   process.stdout.write(
     safeStringify({
+      status: "ready",
       tx_hash: txHash,
-      cached: false,
-      contract: ADDRESS,
+      article_id: aid,
+      tx_status: receipt?.status ?? null,
       analysis,
     }),
   );
   process.exit(0);
-} catch (e) {
-  fail(e?.message || String(e));
 }
