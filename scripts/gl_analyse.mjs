@@ -208,21 +208,44 @@ async function runStatus(client) {
     }
   }
 
-  // Storage miss. Try to read the receipt directly. If the tx has reached
-  // COMMITTING the leader's verdict is already in the receipt blob.
+  // Storage miss. Try to grab a receipt directly. Different networks reach
+  // different terminal states first (Bradbury exposes COMMITTING for many
+  // seconds before ACCEPTED; Studio jumps straight to ACCEPTED). We try
+  // each in order of usefulness and accept whichever the SDK can deliver.
   let receipt = null;
-  try {
-    receipt = await client.waitForTransactionReceipt({
-      hash: txHash,
-      status: TransactionStatus.COMMITTING,
-      fullTransaction: true,
-      timeout: 5_000, // short — we want this poll to be quick
-      pollingInterval: 1_000,
-      retryCount: 0,
-    });
-  } catch (e) {
-    // Most common: still PENDING/PROPOSING. Report pending.
-    const m = (e?.message || "").match(/current status: (\d+)/i);
+  let lastErr = null;
+  const targets = [
+    TransactionStatus.ACCEPTED,
+    TransactionStatus.COMMITTING,
+    TransactionStatus.FINALIZED,
+  ].filter((t) => t !== undefined);
+  for (const status of targets) {
+    try {
+      receipt = await client.waitForTransactionReceipt({
+        hash: txHash,
+        status,
+        fullTransaction: true,
+        timeout: 4_000, // short per attempt — total <12s for all three
+        pollingInterval: 1_000,
+        retryCount: 0,
+      });
+      if (receipt) break;
+    } catch (e) {
+      lastErr = e;
+      // Keep trying the next status target.
+    }
+  }
+  // Last-ditch: ask for the bare tx without status gating. Some SDK builds
+  // expose `getTransaction`; not all do.
+  if (!receipt && typeof client.getTransaction === "function") {
+    try {
+      receipt = await client.getTransaction({ hash: txHash });
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!receipt) {
+    const m = (lastErr?.message || "").match(/current status: (\d+)/i);
     const currentStatus = m ? Number(m[1]) : null;
     process.stdout.write(
       safeStringify({
@@ -384,16 +407,23 @@ async function runStatus(client) {
   let analysis = extractReturnValue(receipt);
 
   if (analysis == null) {
-    // Receipt available but verdict not yet extractable — usually means
-    // the leader's eq-block hasn't been finalized into the receipt yet.
-    // Report pending so the frontend keeps polling; on the next poll the
-    // storage path likely succeeds.
+    // Receipt available but verdict not yet extractable. Dump the receipt
+    // shape to stderr so Fly logs show us where the verdict actually lives
+    // on whichever network we're on. Truncated to keep logs manageable.
+    try {
+      const dump = safeStringify(receipt).slice(0, 4000);
+      const keys = receipt && typeof receipt === "object" ? Object.keys(receipt) : [];
+      process.stderr.write(
+        `[gl_analyse] no verdict in receipt. status_name=${receipt?.status_name ?? receipt?.status ?? "?"} ` +
+          `keys=${keys.join(",")} dump=${dump}\n`,
+      );
+    } catch {}
     process.stdout.write(
       safeStringify({
         status: "pending",
         tx_hash: txHash,
         article_id: aid,
-        tx_status: receipt?.status ?? null,
+        tx_status: receipt?.status_name ?? receipt?.status ?? null,
         note: "receipt has no verdict yet",
       }),
     );
