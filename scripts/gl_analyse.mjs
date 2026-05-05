@@ -180,76 +180,42 @@ async function runStatus(client) {
   if (!txHash) fail("tx_hash is required for status action");
   if (!aid) fail("article_id is required for status action");
 
-  // First, try the contract storage — if the verdict is already stored at
-  // accepted/finalized state, this is the cheapest path.
-  for (const stateStatus of ["finalized", "accepted"]) {
-    try {
-      const raw = await client.readContract({
-        address: ADDRESS,
-        functionName: "get_analysis",
-        args: [aid],
-        stateStatus,
-      });
-      if (typeof raw === "string" && raw.length > 0) {
-        const parsed = JSON.parse(raw);
-        process.stdout.write(
-          safeStringify({
-            status: "ready",
-            tx_hash: txHash,
-            article_id: aid,
-            tx_status: stateStatus,
-            analysis: parsed,
-          }),
-        );
-        process.exit(0);
-      }
-    } catch (e) {
-      // Empty storage often throws — keep trying.
+  // Fast path: just fetch whatever the chain has for this tx right now.
+  // No status gating, no polling — `getTransaction` returns immediately
+  // with the current receipt, so we never blow the proxy's status budget.
+  // The verdict is already published inside the receipt at COMMITTING on
+  // every network we support; we just need to find it.
+  let receipt = null;
+  let fetchErr = null;
+  try {
+    if (typeof client.getTransaction === "function") {
+      receipt = await client.getTransaction({ hash: txHash });
     }
+  } catch (e) {
+    fetchErr = e;
   }
 
-  // Storage miss. Try to grab a receipt directly. Different networks reach
-  // different terminal states first (Bradbury exposes COMMITTING for many
-  // seconds before ACCEPTED; Studio jumps straight to ACCEPTED). We try
-  // each in order of usefulness and accept whichever the SDK can deliver.
-  let receipt = null;
-  let lastErr = null;
-  // COMMITTING first: the leader's verdict is already published in the
-  // receipt at that stage, so we don't have to wait the extra seconds /
-  // minutes for ACCEPTED or FINALIZED. Fall back only if the SDK refuses
-  // to deliver a receipt at COMMITTING (some networks skip the phase).
-  const targets = [
-    TransactionStatus.COMMITTING,
-    TransactionStatus.ACCEPTED,
-    TransactionStatus.FINALIZED,
-  ].filter((t) => t !== undefined);
-  for (const status of targets) {
+  // Fallback only if the SDK build doesn't expose getTransaction: do one
+  // short waitForTransactionReceipt at COMMITTING (the earliest state
+  // where the leader's verdict is in the receipt).
+  if (!receipt) {
     try {
       receipt = await client.waitForTransactionReceipt({
         hash: txHash,
-        status,
+        status: TransactionStatus.COMMITTING,
         fullTransaction: true,
-        timeout: 4_000, // short per attempt — total <12s for all three
+        timeout: 6_000,
         pollingInterval: 1_000,
         retryCount: 0,
       });
-      if (receipt) break;
     } catch (e) {
-      lastErr = e;
-      // Keep trying the next status target.
+      fetchErr = e;
     }
   }
-  // Last-ditch: ask for the bare tx without status gating. Some SDK builds
-  // expose `getTransaction`; not all do.
-  if (!receipt && typeof client.getTransaction === "function") {
-    try {
-      receipt = await client.getTransaction({ hash: txHash });
-    } catch (e) {
-      lastErr = e;
-    }
-  }
+
   if (!receipt) {
-    const m = (lastErr?.message || "").match(/current status: (\d+)/i);
+    // Tx not yet mined — frontend will poll again.
+    const m = (fetchErr?.message || "").match(/current status: (\d+)/i);
     const currentStatus = m ? Number(m[1]) : null;
     process.stdout.write(
       safeStringify({
@@ -257,6 +223,22 @@ async function runStatus(client) {
         tx_hash: txHash,
         article_id: aid,
         tx_status: currentStatus,
+      }),
+    );
+    process.exit(0);
+  }
+
+  // Bonus: if the receipt is reported as already PENDING/PROPOSING (no
+  // leader output yet), we shortcut to pending instead of running the
+  // verdict walk — saves CPU on every poll until consensus actually fires.
+  const sName = String(receipt?.status_name || "").toUpperCase();
+  if (sName === "PENDING" || sName === "PROPOSING" || sName === "ACTIVATED") {
+    process.stdout.write(
+      safeStringify({
+        status: "pending",
+        tx_hash: txHash,
+        article_id: aid,
+        tx_status: sName,
       }),
     );
     process.exit(0);
@@ -362,6 +344,36 @@ async function runStatus(client) {
     for (const hx of hexFields) {
       const v = findVerdictInHex(hx);
       if (v) return v;
+    }
+
+    // Studio path: equivalence-principle outputs are exposed as plain
+    // (unescaped) JSON strings at well-known keys. Try them before doing
+    // the expensive recursive walk.
+    const epStrings = [
+      r?.equivalence_principle_outputs,
+      r?.equivalencePrincipleOutputs,
+      r?.eq_outputs,
+      r?.consensus_data?.last_round?.equivalence_principle_outputs,
+      r?.consensus_data?.last_round?.eq_outputs,
+      r?.consensus_data?.leader_receipt?.[0]?.equivalence_principle_outputs,
+      r?.consensus_data?.leader_receipt?.[0]?.eq_outputs,
+    ];
+    for (const ep of epStrings) {
+      if (!ep) continue;
+      const items = Array.isArray(ep) ? ep : [ep];
+      for (const it of items) {
+        // Each item may be { return, output, value } or a bare string.
+        const candidates = typeof it === "string"
+          ? [it]
+          : [it?.return, it?.output, it?.value, it?.data];
+        for (const c of candidates) {
+          if (typeof c !== "string" || !c.trim().startsWith("{")) continue;
+          try {
+            const parsed = JSON.parse(c);
+            if (looksLikeVerdict(parsed)) return parsed;
+          } catch {}
+        }
+      }
     }
 
     // Last-resort: walk every nested object/array looking for either a

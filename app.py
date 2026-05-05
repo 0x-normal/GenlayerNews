@@ -343,11 +343,13 @@ def gl_submit(title: str, content: str, network_key: str | None = None) -> dict:
 
 
 def gl_status(tx_hash: str, article_id: str, network_key: str | None = None) -> dict:
-    """Phase 2: poll the chain to see if the verdict is ready. Each call is
-    designed to complete in <10s."""
+    """Phase 2: poll the chain to see if the verdict is ready. The helper
+    aims for <10s per call, but Studio's `getTransaction` round-trip can
+    spike under load — give it 45s of headroom so a slow RPC blip doesn't
+    crash the analyse-loading UI with a timeout."""
     return _run_gl_helper(
         {"action": "status", "tx_hash": tx_hash, "article_id": article_id},
-        timeout_s=30,  # short — frontend will retry on the next poll
+        timeout_s=45,
         network_key=network_key,
     )
 
