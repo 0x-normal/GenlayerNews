@@ -1,0 +1,31 @@
+name: Deploy to Fly.io
+
+# Auto-deploys on every push to main once the app is created on Fly and
+# FLY_API_TOKEN is added to the repo's GitHub Actions secrets.
+#
+# One-time setup (no CLI required if you do steps 1-2 in the browser):
+#   1. Sign in at https://fly.io and create a new app from your repo
+#      (Fly's web "Launch" flow detects the Dockerfile + fly.toml).
+#   2. In Fly dashboard: Tokens -> "Create deploy token". Copy it.
+#   3. In GitHub: Settings -> Secrets and variables -> Actions -> New
+#      repository secret. Name = FLY_API_TOKEN, value = the token.
+#   4. Set runtime secrets on Fly (NEWS_ORACLE_ADDRESS, GENLAYER_PRIVATE_KEY,
+#      NEWS_API_KEY) via the Fly dashboard's Secrets tab.
+#   5. Push to main — this workflow does the rest.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy app
+    runs-on: ubuntu-latest
+    concurrency: deploy-group  # never run two deploys in parallel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
