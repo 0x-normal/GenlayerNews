@@ -72,11 +72,16 @@ try {
   });
 
   // The deployed address shows up under different keys depending on the
-  // SDK's receipt shape — try the usual ones in order.
+  // SDK / network — Studio puts it under `data.contract_address` and also
+  // mirrors it as `recipient`, while Bradbury exposes a top-level field.
   const addr =
+    receipt?.data?.contract_address ||
+    receipt?.data?.contractAddress ||
     receipt?.contract_address ||
     receipt?.contractAddress ||
     receipt?.deployedContract ||
+    receipt?.recipient ||
+    receipt?.to_address ||
     receipt?.consensusData?.leaderReceipt?.[0]?.contractAddress ||
     receipt?.consensusData?.leaderReceipt?.[0]?.contract_address ||
     null;
