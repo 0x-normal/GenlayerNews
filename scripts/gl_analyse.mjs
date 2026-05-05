@@ -214,9 +214,13 @@ async function runStatus(client) {
   // each in order of usefulness and accept whichever the SDK can deliver.
   let receipt = null;
   let lastErr = null;
+  // COMMITTING first: the leader's verdict is already published in the
+  // receipt at that stage, so we don't have to wait the extra seconds /
+  // minutes for ACCEPTED or FINALIZED. Fall back only if the SDK refuses
+  // to deliver a receipt at COMMITTING (some networks skip the phase).
   const targets = [
-    TransactionStatus.ACCEPTED,
     TransactionStatus.COMMITTING,
+    TransactionStatus.ACCEPTED,
     TransactionStatus.FINALIZED,
   ].filter((t) => t !== undefined);
   for (const status of targets) {
