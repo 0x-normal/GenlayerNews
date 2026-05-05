@@ -266,9 +266,16 @@ def analyse_via_openai(title: str, content: str) -> dict:
     deterministic mock tx hash so the proof UI still renders.
     """
     if not OPENAI_API_KEY:
+        missing = []
+        if not NEWS_ORACLE_ADDRESS:
+            missing.append("NEWS_ORACLE_ADDRESS")
+        if not GENLAYER_PRIVATE_KEY:
+            missing.append("GENLAYER_PRIVATE_KEY")
         raise RuntimeError(
-            "Neither GenLayer (GENLAYER_RPC_URL + NEWS_ORACLE_ADDRESS) nor a "
-            "preview LLM (OPENAI_API_KEY) is configured. See .env.example."
+            "GenLayer mode is not configured: missing env var(s) "
+            f"{', '.join(missing) or '(unknown)'}. "
+            "Set them in your hosting provider's Secrets / Environment tab. "
+            "Alternatively, set OPENAI_API_KEY for preview mode."
         )
 
     text = f"Title: {title}\n\nContent: {(content or title)[:3000]}"
