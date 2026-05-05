@@ -105,6 +105,12 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.route("/healthz")
+def healthz():
+    """Lightweight liveness probe used by Fly / load balancers."""
+    return jsonify({"ok": True, "mode": "genlayer" if GENLAYER_ENABLED else "preview"}), 200
+
+
 # ───────────────────────── News proxies ────────────────────────────────────
 
 @app.route("/api/news")

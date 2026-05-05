@@ -1,0 +1,40 @@
+# fly.toml — replace `app` value below with your fly app name on first deploy
+# (or run `fly launch` and let it generate one). Region `lhr` is London;
+# pick one near you with `fly platform regions`.
+
+app = "genlayer-news"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  GENLAYER_NETWORK = "testnetBradbury"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"   # idle -> stop; saves money
+  auto_start_machines = true    # start on next request
+  min_machines_running = 0
+  processes = ["app"]
+
+  # Bradbury can take several minutes to reach COMMITTING, so the proxy
+  # must hold the connection open. 60 minutes is the Fly maximum.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 25
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "20s"
+  method = "GET"
+  path = "/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
