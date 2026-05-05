@@ -1,0 +1,16 @@
+{
+  "name": "genlayer-news",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node helper that submits NewsOracle.analyze() transactions to GenLayer Testnet Bradbury via genlayer-js.",
+  "scripts": {
+    "analyse": "node scripts/gl_analyse.mjs"
+  },
+  "dependencies": {
+    "genlayer-js": "^1.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
