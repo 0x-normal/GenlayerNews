@@ -180,24 +180,28 @@ async function runStatus(client) {
   if (!txHash) fail("tx_hash is required for status action");
   if (!aid) fail("article_id is required for status action");
 
-  // Fast path: just fetch whatever the chain has for this tx right now.
-  // No status gating, no polling — `getTransaction` returns immediately
-  // with the current receipt, so we never blow the proxy's status budget.
-  // The verdict is already published inside the receipt at COMMITTING on
-  // every network we support; we just need to find it.
+  // Fast path: getTransactionReceipt returns the GenLayer-shaped receipt
+  // (with consensus_data, equivalence_principle_outputs, etc.) for the
+  // tx's *current* state — no status gating, no polling. This is what
+  // contains the verdict once the tx hits COMMITTING.
+  //
+  // (Note: client.getTransaction is viem-style and returns only the tx
+  //  envelope without consensus_data — useless to us here.)
   let receipt = null;
   let fetchErr = null;
+  let fetchPath = "none";
   try {
-    if (typeof client.getTransaction === "function") {
-      receipt = await client.getTransaction({ hash: txHash });
+    if (typeof client.getTransactionReceipt === "function") {
+      receipt = await client.getTransactionReceipt({ hash: txHash });
+      fetchPath = "getTransactionReceipt";
     }
   } catch (e) {
     fetchErr = e;
   }
 
-  // Fallback only if the SDK build doesn't expose getTransaction: do one
-  // short waitForTransactionReceipt at COMMITTING (the earliest state
-  // where the leader's verdict is in the receipt).
+  // Fallback: short waitForTransactionReceipt at COMMITTING. Some tx
+  // states cause getTransactionReceipt to throw "tx not found" while the
+  // wait variant happily returns whatever is available now.
   if (!receipt) {
     try {
       receipt = await client.waitForTransactionReceipt({
@@ -208,10 +212,12 @@ async function runStatus(client) {
         pollingInterval: 1_000,
         retryCount: 0,
       });
+      fetchPath = "waitForTransactionReceipt(COMMITTING)";
     } catch (e) {
       fetchErr = e;
     }
   }
+  process.stderr.write(`[gl_analyse] status fetch path=${fetchPath}\n`);
 
   if (!receipt) {
     // Tx not yet mined — frontend will poll again.
