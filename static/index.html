@@ -1433,6 +1433,55 @@
             animation: shim 1.5s infinite;
         }
 
+        /* slow-poll tip: surfaces after ~30s on Bradbury when Studio is up */
+        .slow-tip {
+            margin: 0.4rem 0 0.2rem;
+            padding: 0.75rem 0.9rem;
+            border: 1px solid var(--border);
+            border-left: 2px solid var(--tee);
+            border-radius: 4px;
+            background: color-mix(in srgb, var(--tee) 6%, transparent);
+            animation: fadeIn 0.25s ease-out;
+        }
+        .slow-tip-head {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.5rem;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--tee);
+            margin-bottom: 0.35rem;
+        }
+        .slow-tip-body {
+            font-size: 0.72rem;
+            color: var(--ink);
+            margin-bottom: 0.6rem;
+            line-height: 1.4;
+        }
+        .slow-tip-btn {
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.5rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            padding: 0.45rem 0.85rem;
+            border: 1px solid var(--tee);
+            background: var(--tee);
+            color: #fff;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-right: 0.4rem;
+            transition: opacity 0.15s;
+        }
+        .slow-tip-btn:hover { opacity: 0.85; }
+        .slow-tip-btn-ghost {
+            background: transparent;
+            color: var(--muted);
+            border-color: var(--border);
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-2px) }
+            to   { opacity: 1; transform: translateY(0) }
+        }
+
         @keyframes shim {
             0% {
                 background-position: 200% 0
@@ -2089,15 +2138,26 @@
             return d;
         }
 
+        // Monotonically-increasing token: bumped at the start of every
+        // doAnalyse() call. The poll loop bails the moment it sees a newer
+        // token, which is how the "Switch to Studio" tip cancels the
+        // in-flight Bradbury poll.
+        let analyseToken = 0;
+
         // Phase 2: poll until the verdict is ready. Each poll completes in
         // <10s on the server side, so the edge proxy never times us out
         // even if Bradbury takes 10+ minutes to commit.
-        async function pollAnalyseStatus(txHash, articleId, onTick) {
+        async function pollAnalyseStatus(txHash, articleId, onTick, token) {
             const POLL_INTERVAL = 5_000;          // 5s between polls
             const MAX_POLL_MS = 15 * 60 * 1000;   // 15 min total budget
             const start = Date.now();
             let pollCount = 0;
             while (Date.now() - start < MAX_POLL_MS) {
+                if (token != null && token !== analyseToken) {
+                    const err = new Error('aborted');
+                    err.aborted = true;
+                    throw err;
+                }
                 pollCount++;
                 onTick && onTick(pollCount, txHash);
                 await new Promise(r => setTimeout(r, POLL_INTERVAL));
@@ -2120,11 +2180,11 @@
 
         // Convenience wrapper: submit + (if needed) poll. Returns final
         // ready-state response.
-        async function callAnalyseAPI(item, onTick) {
+        async function callAnalyseAPI(item, onTick, token) {
             const submitted = await submitAnalyse(item);
             if (submitted.status === 'ready') return submitted;
             // Pending — poll. Update the loading UI on every tick.
-            return await pollAnalyseStatus(submitted.tx_hash, submitted.article_id, onTick);
+            return await pollAnalyseStatus(submitted.tx_hash, submitted.article_id, onTick, token);
         }
 
         async function doAnalyse(id) {
@@ -2135,19 +2195,31 @@
             if (btn) { btn.disabled = true; btn.innerHTML = `<span class="bspin">↻</span>&nbsp;Analysing…` }
             showLoading(item.title);
 
+            // Bump the token so any poll loop from a previous click bails.
+            const myToken = ++analyseToken;
+            // Snapshot the network this call is running against — used by
+            // the loading UI to decide when to surface the "Switch to Studio"
+            // tip below.
+            const startedOnNetwork = currentNetwork;
+
             const MAX_RETRIES = 5;
             const RETRY_DELAY = 1800; // ms between retries
+            // After ~30s of polling on Bradbury, surface a one-click switch
+            // to Studio (which is ~10× faster). Threshold tuned to the 5s
+            // poll interval: 6 polls ≈ 30s.
+            const SLOW_POLL_THRESHOLD = 6;
 
             const onTick = (n, tx) => {
                 const lbl = document.querySelector('.aploading-lbl');
                 if (!lbl) return;
                 const short = tx ? tx.slice(0, 10) + '…' + tx.slice(-6) : '';
                 lbl.innerHTML = `<span class="lspin"></span>Waiting for consensus… (poll #${n}${short ? ' · ' + esc(short) : ''})`;
+                maybeShowSlowTip(id, n, startedOnNetwork);
             };
 
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
                 try {
-                    const d = await callAnalyseAPI(item, onTick);
+                    const d = await callAnalyseAPI(item, onTick, myToken);
                     cache[id] = {
                         item,
                         analysis: d.analysis,
@@ -2160,6 +2232,10 @@
                     showResult(id);
                     return; // success — exit
                 } catch (e) {
+                    if (e?.aborted) {
+                        // Superseded by a newer doAnalyse() call — bail silently.
+                        return;
+                    }
                     const msg = e.message || '';
                     if (isTransient(msg) && attempt < MAX_RETRIES) {
                         // Transient payment error — update loading label and retry silently
@@ -2184,9 +2260,40 @@
       <div class="ar-h">${esc(title)}</div>
       <div class="aploading">
         <div class="aploading-lbl"><span class="lspin"></span>Running multi-validator AI consensus…</div>
+        <div class="slow-tip" id="slow-tip" style="display:none"></div>
         ${['80%', '50%', '90%', '42%', '72%', '35%', '60%'].map(w => `<div class="sk" style="width:${w}"></div>`).join('')}
       </div>
     </div>`;
+        }
+
+        // After a few slow polls on Bradbury, suggest switching to Studio if
+        // it's actually configured. Idempotent — safe to call on every tick.
+        function maybeShowSlowTip(id, pollNum, startedOnNetwork) {
+            const host = document.getElementById('slow-tip');
+            if (!host) return;
+            if (pollNum < 6) return;
+            if (startedOnNetwork !== 'bradbury') return;
+            const studio = availableNetworks.find(n => n.key === 'studionet' && n.available);
+            if (!studio) return;
+            if (host.dataset.shown === '1') return;
+            host.dataset.shown = '1';
+            host.style.display = 'block';
+            host.innerHTML = `
+              <div class="slow-tip-head">Bradbury consensus can take 1–10 min…</div>
+              <div class="slow-tip-body">Studio runs the same contract with a faster validator set. Want to retry there?</div>
+              <button class="slow-tip-btn" onclick="switchToStudio('${esc(id)}')">⚡ Switch to Studio &amp; retry</button>
+              <button class="slow-tip-btn slow-tip-btn-ghost" onclick="document.getElementById('slow-tip').style.display='none'">Keep waiting</button>
+            `;
+        }
+
+        // Cancel the in-flight Bradbury poll, flip the network pill, and
+        // re-run the analysis on Studio.
+        function switchToStudio(id) {
+            const studio = availableNetworks.find(n => n.key === 'studionet' && n.available);
+            if (!studio) return;
+            setNetwork('studionet');     // bumps no token by itself
+            analyseToken++;              // explicitly abort any active poll
+            doAnalyse(id);
         }
 
         function showResult(id) {
